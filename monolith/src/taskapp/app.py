@@ -24,6 +24,16 @@ def create_app(db_path=None):
             g.db.row_factory = sqlite3.Row
         return g.db
 
+    @app.after_request
+    def security_headers(response):
+        # naglowki bezpieczenstwa wskazane przez skan DAST (OWASP ZAP)
+        response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+        response.headers["Permissions-Policy"] = "geolocation=(), camera=(), microphone=()"
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     @app.teardown_appcontext
     def close_db(_exc):
         conn = g.pop("db", None)
