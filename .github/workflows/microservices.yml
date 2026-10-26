@@ -1,0 +1,250 @@
+name: Mikroserwisy CI/CD
+
+# Gałęzie jak dla monolitu: feature/** -> CI, develop -> TEST, main -> TEST + PROD (zatwierdzenie).
+# Każdy mikroserwis ma własny stos technologiczny (catalog: Python, gateway: Node.js/npm),
+# osobny obraz w GHCR i osobny Deployment; wdrażane są razem jako jedna wersja systemu.
+on:
+  push:
+    branches: [main, develop, "feature/**"]
+    paths: ["microservices/**", "k8s/microservices.yaml", "deploy/**", ".github/workflows/microservices.yml"]
+  pull_request:
+    branches: [main, develop]
+    paths: ["microservices/**"]
+  workflow_dispatch:
+    inputs:
+      simulate_failure:
+        description: "Wdróż uszkodzoną wersję na TEST (test automatycznego rollbacku)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+  issues: write
+
+jobs:
+  version:
+    name: 0. Wersja
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      catalog: ${{ steps.v.outputs.catalog }}
+      gateway: ${{ steps.v.outputs.gateway }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: v
+        run: |
+          BASE=$(cat microservices/VERSION); SHA=${GITHUB_SHA::7}
+          case "$GITHUB_REF_NAME" in
+            main) TAG="$BASE-$SHA" ;; develop) TAG="$BASE-dev.$GITHUB_RUN_NUMBER" ;; *) TAG="$BASE-ci.$GITHUB_RUN_NUMBER" ;;
+          esac
+          OWNER=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          { echo "version=$BASE"; echo "tag=$TAG"
+            echo "catalog=ghcr.io/$OWNER/lab10-catalog:$TAG"; echo "gateway=ghcr.io/$OWNER/lab10-gateway:$TAG"; } >> "$GITHUB_OUTPUT"
+
+  # ----------------------------------------------- BUILD + UNIT + SAST (macierz)
+  build:
+    name: 1. Build + testy + SAST (${{ matrix.service }})
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [catalog, gateway]
+    defaults: {run: {working-directory: "microservices/${{ matrix.service }}"}}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        if: matrix.service == 'catalog'
+        with: {python-version: "3.12"}
+      - name: "catalog: lint, testy jednostkowe, Bandit"
+        if: matrix.service == 'catalog'
+        run: |
+          pip install -r ../requirements-dev.txt
+          flake8 --max-line-length 120 .
+          pytest -v tests
+          bandit -r app.py -ll
+
+      - uses: actions/setup-node@v5
+        if: matrix.service == 'gateway'
+        with: {node-version: 22, cache: npm, cache-dependency-path: microservices/gateway/package-lock.json}
+      - name: "gateway: npm ci, lint, testy jednostkowe, npm audit"
+        if: matrix.service == 'gateway'
+        run: |
+          npm ci
+          npm run lint
+          npm test
+          npm audit --audit-level=high
+
+      - name: Budowa obrazu
+        run: |
+          docker build --build-arg APP_VERSION=${{ needs.version.outputs.tag }} -t ${{ matrix.service }}:ci .
+          docker save ${{ matrix.service }}:ci -o /tmp/${{ matrix.service }}.tar
+      - uses: actions/upload-artifact@v4
+        with: {name: "image-${{ matrix.service }}", path: "/tmp/${{ matrix.service }}.tar", retention-days: 1}
+
+  # ------------------------------------------ TESTY INTEGRACYJNE + DAST + TRIVY
+  integration:
+    name: 2. Testy integracyjne + DAST + skan obrazów
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with: {pattern: "image-*", merge-multiple: true, path: /tmp/images}
+      - name: Wczytanie obrazów z etapu build
+        run: for f in /tmp/images/*.tar; do docker load -i "$f"; done
+      - name: Uruchomienie stosu (docker compose)
+        working-directory: microservices
+        run: CATALOG_IMAGE=catalog:ci GATEWAY_IMAGE=gateway:ci docker compose up -d --no-build --wait
+      - uses: actions/setup-python@v6
+        with: {python-version: "3.12"}
+      - name: Testy integracyjne gateway <-> catalog
+        run: |
+          pip install pytest==8.3.3 requests==2.32.3
+          BASE_URL=http://localhost:8080 pytest -v microservices/tests/integration
+      - name: DAST - OWASP ZAP baseline (gateway)
+        run: |
+          mkdir -p zap && chmod 777 zap
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t http://localhost:8080/ -r zap-gateway.html -J zap-gateway.json -I
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          alerts = json.load(open("zap/zap-gateway.json"))["site"][0]["alerts"]
+          print("### DAST (OWASP ZAP) - mikroserwisy\n\n| Ryzyko | Alert | Liczba |\n| --- | --- | --- |")
+          for a in sorted(alerts, key=lambda a: -int(a["riskcode"])):
+              print(f'| {a["riskdesc"].split(" (")[0]} | {a["name"]} | {a["count"]} |')
+          high = [a for a in alerts if a["riskcode"] == "3"]
+          print(f"\nAlerty wysokiego ryzyka: {len(high)}")
+          raise SystemExit(1 if high else 0)
+          PY
+      - name: Skan obrazów (Trivy) - bramka CRITICAL
+        run: |
+          for IMG in catalog:ci gateway:ci; do
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.57.1 image \
+              --severity HIGH,CRITICAL --ignore-unfixed --no-progress "$IMG" | tee -a trivy.txt
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.57.1 image \
+              --severity CRITICAL --ignore-unfixed --exit-code 1 --quiet "$IMG"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: microservices-security-reports
+          path: |
+            zap/
+            trivy.txt
+      - name: Logi (przy błędzie)
+        if: failure()
+        working-directory: microservices
+        run: docker compose logs
+
+  # --------------------------------------------------------- DELIVERY (macierz)
+  delivery:
+    name: 3. Delivery GHCR (${{ matrix.service }})
+    needs: [version, integration]
+    if: github.event_name != 'pull_request' && (github.ref_name == 'main' || github.ref_name == 'develop')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [catalog, gateway]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with: {registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}"}
+      - name: Publikacja obrazu (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: microservices/${{ matrix.service }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: APP_VERSION=${{ needs.version.outputs.tag }}
+          tags: ${{ needs.version.outputs[matrix.service] }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.version.outputs.tag }}
+
+  # --------------------------------------- POBRANIE ARTEFAKTÓW NA KOLEJNYM ETAPIE
+  verify-artifacts:
+    name: 4. Weryfikacja artefaktów z GHCR
+    needs: [version, delivery]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Pobranie obrazów z GHCR i uruchomienie stosu
+        working-directory: microservices
+        env:
+          CATALOG_IMAGE: ${{ needs.version.outputs.catalog }}
+          GATEWAY_IMAGE: ${{ needs.version.outputs.gateway }}
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker compose pull
+          docker compose up -d --no-build --wait
+          curl -fsS localhost:8080/ && curl -fsS localhost:8080/api/products
+
+  # ----------------------------------------------------------- DEPLOY: TEST
+  deploy-test:
+    name: 5. Deploy TEST
+    needs: [version, verify-artifacts]
+    runs-on: [self-hosted, lab10]
+    environment: {name: test, url: "http://localhost:30120"}
+    concurrency: {group: deploy-test-microservices, cancel-in-progress: false}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Wdrożenie z automatycznym rollbackiem
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          SIMULATE_FAILURE: ${{ inputs.simulate_failure && '1' || '0' }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          bash deploy/deploy.sh test microservices "${{ needs.version.outputs.catalog }}" "${{ needs.version.outputs.gateway }}"
+
+  # ----------------------------------------------------------- DEPLOY: PROD
+  deploy-prod:
+    name: 6. Deploy PROD (wymaga zatwierdzenia)
+    needs: [version, deploy-test]
+    if: github.ref_name == 'main' && github.event_name == 'push'
+    runs-on: [self-hosted, lab10]
+    environment: {name: production, url: "http://localhost:30220"}
+    concurrency: {group: deploy-prod-microservices, cancel-in-progress: false}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Wdrożenie z automatycznym rollbackiem
+        env: {GHCR_TOKEN: "${{ secrets.GITHUB_TOKEN }}", GHCR_USER: "${{ github.actor }}", COMMIT: "${{ github.sha }}"}
+        run: |
+          bash deploy/deploy.sh prod microservices "${{ needs.version.outputs.catalog }}" "${{ needs.version.outputs.gateway }}"
+
+  # ----------------------------------------------------------- POWIADOMIENIA
+  notify:
+    name: 7. Powiadomienie
+    needs: [version, build, integration, delivery, verify-artifacts, deploy-test, deploy-prod]
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      RESULT: ${{ contains(needs.*.result, 'failure') && 'BŁĄD' || (contains(needs.*.result, 'cancelled') && 'PRZERWANY' || 'SUKCES') }}
+      DETAILS: "build=${{ needs.build.result }} integration=${{ needs.integration.result }} delivery=${{ needs.delivery.result }} verify=${{ needs.verify-artifacts.result }} test=${{ needs.deploy-test.result }} prod=${{ needs.deploy-prod.result }}"
+    steps:
+      - name: Status w podsumowaniu
+        run: |
+          echo "## Pipeline mikroserwisów: $RESULT" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$DETAILS\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "$RESULT: $DETAILS"
+      - name: Zgłoszenie (issue) przy błędzie na main/develop
+        if: env.RESULT == 'BŁĄD' && (github.ref_name == 'main' || github.ref_name == 'develop')
+        run: |
+          gh issue create -R "$GITHUB_REPOSITORY" \
+            --title "❌ Pipeline mikroserwisów nieudany: ${GITHUB_REF_NAME} @ ${GITHUB_SHA::7}" \
+            --body "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          Etapy: \`$DETAILS\`"
+      - name: Powiadomienie Slack (gdy ustawiono sekret SLACK_WEBHOOK_URL)
+        if: env.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -s -X POST -H 'Content-Type: application/json' \
+            -d "{\"text\": \"Mikroserwisy $RESULT ($GITHUB_REF_NAME @ ${GITHUB_SHA::7}): $DETAILS\"}" "$SLACK_WEBHOOK_URL"

@@ -1,0 +1,48 @@
+# Aplikacja monolityczna: jeden Deployment + Service (wartości __X__ podstawia deploy.sh)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: monolith
+  namespace: __NS__
+  labels: {app: monolith, type: monolith}
+spec:
+  replicas: __REPLICAS__
+  progressDeadlineSeconds: 120
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels: {app: monolith}
+  template:
+    metadata:
+      labels: {app: monolith, type: monolith}
+      annotations: {deploy/commit: "__COMMIT__"}
+    spec:
+      containers:
+        - name: app
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: APP_ENV, value: "__APP_ENV__"}
+            - {name: APP_BROKEN, value: "__BROKEN__"}
+          ports: [{containerPort: 8000}]
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 3
+          livenessProbe:
+            httpGet: {path: /, port: 8000}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 20m, memory: 64Mi}
+            limits: {cpu: 300m, memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: monolith
+  namespace: __NS__
+spec:
+  type: NodePort
+  selector: {app: monolith}
+  ports: [{port: 80, targetPort: 8000, nodePort: __MONO_PORT__}]

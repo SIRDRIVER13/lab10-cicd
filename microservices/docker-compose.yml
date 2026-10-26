@@ -1,0 +1,25 @@
+# Stos mikroserwisów do testów integracyjnych i uruchomienia lokalnego
+services:
+  catalog:
+    image: ${CATALOG_IMAGE:-catalog:local}
+    build: {context: ./catalog, args: {APP_VERSION: "${APP_VERSION:-dev}"}}
+    environment:
+      APP_VERSION: ${APP_VERSION:-dev}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      retries: 10
+  gateway:
+    image: ${GATEWAY_IMAGE:-gateway:local}
+    build: {context: ./gateway, args: {APP_VERSION: "${APP_VERSION:-dev}"}}
+    environment:
+      APP_VERSION: ${APP_VERSION:-dev}
+      APP_ENV: compose
+      CATALOG_URL: http://catalog:8000
+    ports: ["8080:8080"]
+    depends_on:
+      catalog: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 5s
+      retries: 10

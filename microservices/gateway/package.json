@@ -1,0 +1,16 @@
+{
+  "name": "gateway",
+  "version": "1.0.0",
+  "description": "Mikroserwis gateway - publiczne API, pobiera dane z serwisu catalog (Node.js / Express)",
+  "main": "src/server.js",
+  "private": true,
+  "scripts": {
+    "start": "node src/server.js",
+    "lint": "node --check src/app.js && node --check src/server.js",
+    "test": "node --test"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "express": "5.2.1"
+  }
+}

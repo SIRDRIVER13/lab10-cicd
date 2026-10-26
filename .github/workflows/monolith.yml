@@ -1,0 +1,287 @@
+name: Monolit CI/CD
+
+# Gałęzie:
+#   feature/**  -> CI: build, testy, SAST, DAST (bez publikacji i wdrożenia)
+#   develop     -> CI + publikacja wersji -dev + wdrożenie na TEST
+#   main        -> CI + publikacja wersji + Release z paczką .whl + TEST + (zatwierdzenie) PROD
+# Workflow uruchamia się tylko przy zmianach dotyczących monolitu.
+on:
+  push:
+    branches: [main, develop, "feature/**"]
+    paths: ["monolith/**", "k8s/monolith.yaml", "deploy/**", ".github/workflows/monolith.yml"]
+  pull_request:
+    branches: [main, develop]
+    paths: ["monolith/**"]
+  workflow_dispatch:
+    inputs:
+      simulate_failure:
+        description: "Wdróż uszkodzoną wersję na TEST (test automatycznego rollbacku)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write     # GitHub Release z paczką .whl
+  packages: write     # publikacja obrazu w GHCR
+  issues: write       # zgłoszenie przy błędzie pipeline
+
+env:
+  APP_DIR: monolith
+
+jobs:
+  # ------------------------------------------------------------------ BUILD
+  build:
+    name: 1. Build + testy jednostkowe
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+      image: ${{ steps.ver.outputs.image }}
+      release_image: ${{ steps.ver.outputs.release_image }}
+    defaults: {run: {working-directory: monolith}}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: {python-version: "3.12", cache: pip, cache-dependency-path: monolith/requirements-dev.txt}
+
+      - name: Wersja artefaktu
+        id: ver
+        run: |
+          BASE=$(cat VERSION)
+          SHA=${GITHUB_SHA::7}
+          case "$GITHUB_REF_NAME" in
+            main)    TAG="$BASE-$SHA" ;;
+            develop) TAG="$BASE-dev.$GITHUB_RUN_NUMBER" ;;
+            *)       TAG="$BASE-ci.$GITHUB_RUN_NUMBER" ;;
+          esac
+          OWNER=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "version=$BASE" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$OWNER/lab10-monolith:$TAG" >> "$GITHUB_OUTPUT"
+          [ "$GITHUB_REF_NAME" = main ] && echo "release_image=ghcr.io/$OWNER/lab10-monolith:$BASE" >> "$GITHUB_OUTPUT"
+          echo "Wersja $BASE, tag obrazu $TAG"
+
+      - name: Instalacja narzędzi
+        run: pip install -r requirements-dev.txt && pip install -e .
+
+      - name: Lint (flake8)
+        run: flake8 --max-line-length 120 src tests
+
+      - name: Testy jednostkowe
+        run: pytest -v --junitxml=../reports/unit.xml
+
+      - name: Budowa paczki (.whl + .tar.gz)
+        run: python -m build && ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with: {name: monolith-dist, path: monolith/dist/, retention-days: 7}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: monolith-unit-report, path: reports/}
+
+  # ------------------------------------------------------------------- SAST
+  sast:
+    name: 2. SAST (Bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: {python-version: "3.12"}
+      - name: Analiza statyczna bezpieczeństwa kodu
+        run: |
+          pip install bandit==1.7.10
+          bandit -r monolith/src -f txt -o bandit.txt --exit-zero
+          cat bandit.txt
+          echo '### SAST (Bandit) - monolit' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"; sed -n '/Run metrics/,$p' bandit.txt >> "$GITHUB_STEP_SUMMARY"; echo '```' >> "$GITHUB_STEP_SUMMARY"
+          bandit -r monolith/src -ll -q   # bramka: błąd przy problemach Medium/High
+
+  # ------------------------------------------------- TESTY INTEGRACYJNE + DAST
+  integration:
+    name: 3. Testy integracyjne + DAST + skan obrazu
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with: {name: monolith-dist, path: monolith/dist}
+      - uses: actions/setup-python@v6
+        with: {python-version: "3.12"}
+
+      - name: Obraz z artefaktu .whl
+        run: docker build --build-arg APP_VERSION=${{ needs.build.outputs.tag }} -t monolith:ci monolith
+
+      - name: Uruchomienie kontenera
+        run: docker run -d --name app -p 8000:8000 -e APP_ENV=ci monolith:ci
+
+      - name: Testy integracyjne (HTTP + baza)
+        run: |
+          pip install pytest==8.3.3 requests==2.32.3
+          BASE_URL=http://localhost:8000 pytest -v monolith/tests/integration
+
+      - name: DAST - OWASP ZAP baseline
+        run: |
+          mkdir -p zap && chmod 777 zap
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t http://localhost:8000/ -r zap-monolith.html -J zap-monolith.json -I
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          alerts = json.load(open("zap/zap-monolith.json"))["site"][0]["alerts"]
+          print("### DAST (OWASP ZAP) - monolit\n\n| Ryzyko | Alert | Liczba |\n| --- | --- | --- |")
+          for a in sorted(alerts, key=lambda a: -int(a["riskcode"])):
+              print(f'| {a["riskdesc"].split(" (")[0]} | {a["name"]} | {a["count"]} |')
+          high = [a for a in alerts if a["riskcode"] == "3"]
+          print(f"\nAlerty wysokiego ryzyka: {len(high)}")
+          raise SystemExit(1 if high else 0)
+          PY
+
+      - name: Skan obrazu (Trivy) - bramka CRITICAL
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.57.1 image \
+            --severity HIGH,CRITICAL --ignore-unfixed --no-progress monolith:ci | tee trivy.txt
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.57.1 image \
+            --severity CRITICAL --ignore-unfixed --exit-code 1 --quiet monolith:ci
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: monolith-security-reports
+          path: |
+            zap/
+            trivy.txt
+
+      - name: Logi aplikacji (przy błędzie)
+        if: failure()
+        run: docker logs app
+
+  # --------------------------------------------------------------- DELIVERY
+  delivery:
+    name: 4. Delivery (GHCR + Release)
+    needs: [build, sast, integration]
+    if: github.event_name != 'pull_request' && (github.ref_name == 'main' || github.ref_name == 'develop')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with: {name: monolith-dist, path: monolith/dist}
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with: {registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}"}
+
+      - name: Publikacja obrazu (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: monolith
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: APP_VERSION=${{ needs.build.outputs.tag }}
+          tags: |
+            ${{ needs.build.outputs.image }}
+            ${{ needs.build.outputs.release_image }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.build.outputs.tag }}
+
+      - name: GitHub Release z paczką .whl (tylko main)
+        if: github.ref_name == 'main'
+        env: {GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"}
+        run: |
+          REL="monolith-v${{ needs.build.outputs.version }}"
+          if gh release view "$REL" >/dev/null 2>&1; then
+            echo "::warning::Release $REL już istnieje - artefakty są niezmienne, podnieś wersję w monolith/VERSION"
+          else
+            gh release create "$REL" monolith/dist/* --title "Monolit ${{ needs.build.outputs.version }}" \
+              --notes "Obraz: ${{ needs.build.outputs.image }}"
+          fi
+
+      - name: Podsumowanie
+        run: |
+          echo "### 📦 Delivery - monolit" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Obraz: \`${{ needs.build.outputs.image }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Paczka: \`$(ls monolith/dist/*.whl | xargs -n1 basename)\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------- POBRANIE ARTEFAKTÓW NA KOLEJNYM ETAPIE
+  verify-artifacts:
+    name: 5. Weryfikacja artefaktów z repozytorium
+    needs: [build, delivery]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pobranie obrazu z GHCR i test dymny
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "${{ needs.build.outputs.image }}"
+          docker run -d -p 8000:8000 "${{ needs.build.outputs.image }}"
+          for i in $(seq 1 15); do curl -fsS localhost:8000/health && break; sleep 2; done
+      - name: Pobranie paczki .whl z Release i instalacja (tylko main)
+        if: github.ref_name == 'main'
+        env: {GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"}
+        run: |
+          gh release download "monolith-v${{ needs.build.outputs.version }}" -R "$GITHUB_REPOSITORY" -p "*.whl"
+          python3 -m venv venv && venv/bin/pip install -q ./*.whl
+          venv/bin/gunicorn -b 127.0.0.1:9000 -D "taskapp.app:create_app()" && sleep 3
+          curl -fsS 127.0.0.1:9000/
+
+  # ----------------------------------------------------------- DEPLOY: TEST
+  deploy-test:
+    name: 6. Deploy TEST
+    needs: [build, verify-artifacts]
+    runs-on: [self-hosted, lab10]
+    environment: {name: test, url: "http://localhost:30110"}
+    concurrency: {group: deploy-test-monolith, cancel-in-progress: false}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Wdrożenie z automatycznym rollbackiem
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          SIMULATE_FAILURE: ${{ inputs.simulate_failure && '1' || '0' }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          bash deploy/deploy.sh test monolith "${{ needs.build.outputs.image }}"
+
+  # ----------------------------------------------------------- DEPLOY: PROD
+  deploy-prod:
+    name: 7. Deploy PROD (wymaga zatwierdzenia)
+    needs: [build, deploy-test]
+    if: github.ref_name == 'main' && github.event_name == 'push'
+    runs-on: [self-hosted, lab10]
+    environment: {name: production, url: "http://localhost:30210"}
+    concurrency: {group: deploy-prod-monolith, cancel-in-progress: false}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Wdrożenie z automatycznym rollbackiem
+        env: {GHCR_TOKEN: "${{ secrets.GITHUB_TOKEN }}", GHCR_USER: "${{ github.actor }}", COMMIT: "${{ github.sha }}"}
+        run: |
+          bash deploy/deploy.sh prod monolith "${{ needs.build.outputs.image }}"
+
+  # ----------------------------------------------------------- POWIADOMIENIA
+  notify:
+    name: 8. Powiadomienie
+    needs: [build, sast, integration, delivery, verify-artifacts, deploy-test, deploy-prod]
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      RESULT: ${{ contains(needs.*.result, 'failure') && 'BŁĄD' || (contains(needs.*.result, 'cancelled') && 'PRZERWANY' || 'SUKCES') }}
+      DETAILS: "build=${{ needs.build.result }} sast=${{ needs.sast.result }} integration=${{ needs.integration.result }} delivery=${{ needs.delivery.result }} verify=${{ needs.verify-artifacts.result }} test=${{ needs.deploy-test.result }} prod=${{ needs.deploy-prod.result }}"
+    steps:
+      - name: Status w podsumowaniu
+        run: |
+          echo "## Pipeline monolitu: $RESULT" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$DETAILS\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "$RESULT: $DETAILS"
+      - name: Zgłoszenie (issue) przy błędzie na main/develop
+        if: env.RESULT == 'BŁĄD' && (github.ref_name == 'main' || github.ref_name == 'develop')
+        run: |
+          gh issue create -R "$GITHUB_REPOSITORY" \
+            --title "❌ Pipeline monolitu nieudany: ${GITHUB_REF_NAME} @ ${GITHUB_SHA::7}" \
+            --body "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          Etapy: \`$DETAILS\`"
+      - name: Powiadomienie Slack (gdy ustawiono sekret SLACK_WEBHOOK_URL)
+        if: env.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -s -X POST -H 'Content-Type: application/json' \
+            -d "{\"text\": \"Monolit $RESULT ($GITHUB_REF_NAME @ ${GITHUB_SHA::7}): $DETAILS\"}" "$SLACK_WEBHOOK_URL"

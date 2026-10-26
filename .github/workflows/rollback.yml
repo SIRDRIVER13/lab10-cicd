@@ -1,0 +1,35 @@
+name: Rollback (ręczny)
+
+# Ręczne wycofanie ostatniego wdrożenia wybranej aplikacji na wybranym środowisku.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Środowisko
+        type: choice
+        options: [test, prod]
+      app:
+        description: Typ aplikacji
+        type: choice
+        options: [monolith, microservices]
+
+jobs:
+  rollback:
+    name: Rollback ${{ inputs.app }} na ${{ inputs.environment }}
+    runs-on: [self-hosted, lab10]
+    environment: ${{ inputs.environment == 'prod' && 'production' || 'test' }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: rollout undo + weryfikacja
+        run: |
+          . deploy/envs/${{ inputs.environment }}.env
+          K="kubectl --context kind-lab10 -n $NS"
+          if [ "${{ inputs.app }}" = monolith ]; then DEPS="monolith"; PORT=$MONO_PORT; else DEPS="gateway catalog"; PORT=$GW_PORT; fi
+          echo "### ↩️ Rollback ${{ inputs.app }} na $NS" >> "$GITHUB_STEP_SUMMARY"
+          for D in $DEPS; do
+            BEFORE=$($K get deploy/$D -o jsonpath='{.spec.template.spec.containers[0].image}')
+            $K rollout undo deploy/$D && $K rollout status deploy/$D --timeout=120s
+            AFTER=$($K get deploy/$D -o jsonpath='{.spec.template.spec.containers[0].image}')
+            echo "- $D: \`$BEFORE\` → \`$AFTER\`" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+          curl -fsS "http://localhost:$PORT/health" && curl -s "http://localhost:$PORT/" | tee -a "$GITHUB_STEP_SUMMARY"
