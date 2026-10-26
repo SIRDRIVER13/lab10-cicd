@@ -35,3 +35,9 @@ def test_validation(client):
     assert client.post("/tasks", json={}).status_code == 400
     assert client.post("/tasks", json={"title": "x" * 201}).status_code == 400
     assert client.patch("/tasks/999", json={"done": True}).status_code == 404
+
+
+def test_security_headers(client):
+    headers = client.get("/").headers
+    assert headers["X-Content-Type-Options"] == "nosniff"
+    assert "default-src 'none'" in headers["Content-Security-Policy"]
